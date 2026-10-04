@@ -21,6 +21,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -60,13 +61,20 @@ import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+
+/**
+ * 图像在画布中的填充比例（占画布短边的百分比）。
+ * 0.62 = 图像占 62%，四周各留约 19% 的操作空间。
+ * 数值越小，图像显示越小，四周留白越多，越方便擦除/补画边缘。
+ */
+private const val IMAGE_FILL_FACTOR = 0.62f
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -190,21 +198,6 @@ private fun strokeOnBitmap(
         this.color = color
     }
     canvas.drawLine(from.x, from.y, to.x, to.y, paint)
-}
-
-private fun mapPoint(
-    p: Offset,
-    viewSize: IntSize,
-    bmpW: Float,
-    bmpH: Float
-): Pair<Offset, Float> {
-    val w = viewSize.width.toFloat()
-    val h = viewSize.height.toFloat()
-    if (w <= 0f || h <= 0f || bmpW <= 0f || bmpH <= 0f) return Offset.Zero to 1f
-    val s = minOf(w / bmpW, h / bmpH)
-    val dx = (w - bmpW * s) / 2f
-    val dy = (h - bmpH * s) / 2f
-    return Offset((p.x - dx) / s, (p.y - dy) / s) to s
 }
 
 /**
@@ -373,6 +366,25 @@ fun EditorScreen() {
         }
     }
 
+    fun resetCurrent() {
+        if (busy) return
+        val item = images.getOrNull(index) ?: return
+        scope.launch {
+            busy = true
+            status = "正在重置…"
+            val b = loadBitmap(context, item.uri)
+            bitmap = b
+            modified = false
+            version++
+            busy = false
+            status = if (b == null) {
+                "重置失败：${item.name}"
+            } else {
+                "已重置：${item.name}　${b.width}×${b.height}"
+            }
+        }
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -389,18 +401,19 @@ fun EditorScreen() {
         ) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
             ) {
-                ToolButton("输入", inputTree != null) { inputPicker.launch(null) }
-                ToolButton("输出", outputTree != null) { outputPicker.launch(null) }
-                ToolButton("擦除", eraser) {
+                ToolButton("输入", inputTree != null, true) { inputPicker.launch(null) }
+                ToolButton("输出", outputTree != null, true) { outputPicker.launch(null) }
+                ToolButton("擦除", eraser, true) {
                     eraser = true
                     brushColor = Color.White
                 }
-                ToolButton("补画", !eraser) {
+                ToolButton("补画", !eraser, true) {
                     eraser = false
                     brushColor = Color.Black
                 }
+                ToolButton("重置", false, bitmap != null) { resetCurrent() }
             }
 
             Row(
@@ -451,38 +464,62 @@ fun EditorScreen() {
             }
         }
 
-        // ============ 画布 ============
-        Box(
+        // ============ 画布（图像居中，四周留白） ============
+        BoxWithConstraints(
             modifier = Modifier
                 .weight(1f)
                 .fillMaxWidth()
                 .background(Color(0xFF2B2B33)),
             contentAlignment = Alignment.Center
         ) {
+            val density = LocalDensity.current
+            val containerW = with(density) { maxWidth.toPx() }
+            val containerH = with(density) { maxHeight.toPx() }
+
+            val bmp = bitmap
             val imgBitmap = remember(bitmap, version) { bitmap?.asImageBitmap() }
 
-            if (imgBitmap != null) {
+            if (bmp != null && imgBitmap != null && containerW > 0f && containerH > 0f) {
+                val bmpW = bmp.width.toFloat()
+                val bmpH = bmp.height.toFloat()
+
+                // 先按容器 Fit 得到基准缩放，再乘填充比例，形成四周留白
+                val fitScale = minOf(containerW / bmpW, containerH / bmpH)
+                val displayScale = fitScale * IMAGE_FILL_FACTOR
+                val displayW = (bmpW * displayScale).coerceAtLeast(1f)
+                val displayH = (bmpH * displayScale).coerceAtLeast(1f)
+
                 Image(
                     bitmap = imgBitmap,
                     contentDescription = null,
                     contentScale = ContentScale.Fit,
                     modifier = Modifier
-                        .fillMaxSize()
-                        .pointerInput(bitmap, brushColor, brushSizeDp) {
-                            val bmp = bitmap ?: return@pointerInput
-                            val bmpW = bmp.width.toFloat()
-                            val bmpH = bmp.height.toFloat()
-                            if (bmpW <= 0f || bmpH <= 0f) return@pointerInput
+                        .size(
+                            width = with(density) { displayW.toDp() },
+                            height = with(density) { displayH.toDp() }
+                        )
+                        .pointerInput(bmp, brushColor, brushSizeDp) {
+                            val bW = bmp.width.toFloat()
+                            val bH = bmp.height.toFloat()
+                            if (bW <= 0f || bH <= 0f) return@pointerInput
+                            val viewW = size.width.toFloat()
+                            val viewH = size.height.toFloat()
+                            if (viewW <= 0f || viewH <= 0f) return@pointerInput
+
+                            // Image 的实际尺寸就是缩放后的显示尺寸，
+                            // 因此图片坐标 = 屏幕坐标 / s
+                            val s = viewW / bW
 
                             var last: Offset? = null
 
                             detectDragGestures(
                                 onDragStart = { pos ->
-                                    val (pt, s) = mapPoint(pos, size, bmpW, bmpH)
+                                    val pt = Offset(pos.x / s, pos.y / s)
                                     last = pt
                                     strokeOnBitmap(
                                         bmp, pt, pt,
-                                        brushColor.toArgb(), brushSizeDp.dp.toPx() / s
+                                        brushColor.toArgb(),
+                                        brushSizeDp.dp.toPx() / s
                                     )
                                     modified = true
                                     version++
@@ -491,17 +528,19 @@ fun EditorScreen() {
                                 onDragCancel = { last = null },
                                 onDrag = { change, _ ->
                                     change.consume()
-                                    val (pt, s) = mapPoint(change.position, size, bmpW, bmpH)
+                                    val pt = Offset(change.position.x / s, change.position.y / s)
                                     val prev = last
                                     if (prev != null) {
                                         strokeOnBitmap(
                                             bmp, prev, pt,
-                                            brushColor.toArgb(), brushSizeDp.dp.toPx() / s
+                                            brushColor.toArgb(),
+                                            brushSizeDp.dp.toPx() / s
                                         )
                                     } else {
                                         strokeOnBitmap(
                                             bmp, pt, pt,
-                                            brushColor.toArgb(), brushSizeDp.dp.toPx() / s
+                                            brushColor.toArgb(),
+                                            brushSizeDp.dp.toPx() / s
                                         )
                                     }
                                     last = pt
@@ -601,22 +640,26 @@ fun EditorScreen() {
 private fun RowScope.ToolButton(
     text: String,
     active: Boolean,
+    enabled: Boolean,
     onClick: () -> Unit
 ) {
     Button(
         onClick = onClick,
+        enabled = enabled,
         modifier = Modifier
             .weight(1f)
             .height(44.dp),
         contentPadding = PaddingValues(0.dp),
         colors = ButtonDefaults.buttonColors(
             containerColor = if (active) Color(0xFF2E7DFF) else Color(0xFF34343E),
-            contentColor = Color.White
+            contentColor = Color.White,
+            disabledContainerColor = Color(0xFF252530),
+            disabledContentColor = Color(0xFF666670)
         )
     ) {
         Text(
             text = text,
-            fontSize = 14.sp,
+            fontSize = 13.sp,
             fontWeight = if (active) FontWeight.Bold else FontWeight.Normal
         )
     }
