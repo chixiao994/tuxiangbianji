@@ -5,16 +5,14 @@ import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas as AndroidCanvas
-import android.graphics.Color as AColor
 import android.graphics.Paint
-import android.graphics.PorterDuff
-import android.graphics.PorterDuffXfermode
 import android.net.Uri
 import android.os.Bundle
 import android.provider.DocumentsContract
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -30,8 +28,10 @@ import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.Button
@@ -71,6 +71,7 @@ import kotlinx.coroutines.withContext
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        enableEdgeToEdge()
         setContent {
             MaterialTheme(colorScheme = darkColorScheme()) {
                 Surface(
@@ -148,8 +149,6 @@ private suspend fun listImages(context: Context, treeUri: Uri): List<ImageItem> 
 
 /**
  * 原分辨率加载图片，不做任何降采样，保证像素级无损。
- * 配置强制 ARGB_8888，每个像素 32 位（含 alpha 通道），可安全用于字体制作。
- * 支持读取 PNG 的透明通道。
  */
 private suspend fun loadBitmap(context: Context, uri: Uri): Bitmap? =
     withContext(Dispatchers.IO) {
@@ -179,7 +178,6 @@ private fun strokeOnBitmap(
     bmp: Bitmap,
     from: Offset,
     to: Offset,
-    eraser: Boolean,
     color: Int,
     widthPx: Float
 ) {
@@ -189,12 +187,7 @@ private fun strokeOnBitmap(
         strokeWidth = widthPx.coerceAtLeast(1f)
         strokeCap = Paint.Cap.ROUND
         strokeJoin = Paint.Join.ROUND
-        if (eraser) {
-            this.color = AColor.TRANSPARENT
-            xfermode = PorterDuffXfermode(PorterDuff.Mode.CLEAR)
-        } else {
-            this.color = color
-        }
+        this.color = color
     }
     canvas.drawLine(from.x, from.y, to.x, to.y, paint)
 }
@@ -216,9 +209,7 @@ private fun mapPoint(
 
 /**
  * 把 Bitmap 无损写入输出文件夹。
- * - 始终输出 PNG（无损压缩，像素零丢失，保留透明通道）
- * - 不再合成白底，保留 alpha，方便字体制作时提取笔形轮廓
- * - 文件名 = 原图名去扩展名 + .png，同名覆盖
+ * 始终输出 PNG（无损压缩，像素零丢失）。
  */
 private suspend fun writeBitmapToOutput(
     context: Context,
@@ -240,7 +231,6 @@ private suspend fun writeBitmapToOutput(
             context.contentResolver, outTree, "image/png", fileName
         ) ?: return@withContext false
 
-        // 直接写原始 Bitmap，不做任何中间合成、不缩放、不转码
         context.contentResolver.openOutputStream(newDoc, "w")?.use { os ->
             bmp.compress(Bitmap.CompressFormat.PNG, 100, os)
             os.flush()
@@ -264,7 +254,7 @@ fun EditorScreen() {
     var modified by remember { mutableStateOf(false) }
     var version by remember { mutableIntStateOf(0) }
     var eraser by remember { mutableStateOf(false) }
-    var brushColor by remember { mutableStateOf(Color(0xFFFF3B30)) }
+    var brushColor by remember { mutableStateOf(Color.Black) }
     var brushSizeDp by remember { mutableFloatStateOf(16f) }
     var busy by remember { mutableStateOf(false) }
     var status by remember {
@@ -273,9 +263,10 @@ fun EditorScreen() {
 
     val palette = remember {
         listOf(
-            Color(0xFFFF3B30), Color(0xFFFF9500), Color(0xFFFFCC00),
-            Color(0xFF34C759), Color(0xFF007AFF), Color(0xFFAF52DE),
-            Color(0xFFFFFFFF), Color(0xFF111111)
+            Color(0xFF000000), Color(0xFFFFFFFF),
+            Color(0xFFFF3B30), Color(0xFFFF9500),
+            Color(0xFFFFCC00), Color(0xFF34C759),
+            Color(0xFF007AFF), Color(0xFFAF52DE)
         )
     }
 
@@ -386,7 +377,10 @@ fun EditorScreen() {
         modifier = Modifier
             .fillMaxSize()
             .background(Color(0xFF101014))
+            .statusBarsPadding()
+            .navigationBarsPadding()
     ) {
+        // ============ 顶部工具栏 ============
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -399,8 +393,14 @@ fun EditorScreen() {
             ) {
                 ToolButton("输入", inputTree != null) { inputPicker.launch(null) }
                 ToolButton("输出", outputTree != null) { outputPicker.launch(null) }
-                ToolButton("擦除", eraser) { eraser = true }
-                ToolButton("补画", !eraser) { eraser = false }
+                ToolButton("擦除", eraser) {
+                    eraser = true
+                    brushColor = Color.White
+                }
+                ToolButton("补画", !eraser) {
+                    eraser = false
+                    brushColor = Color.Black
+                }
             }
 
             Row(
@@ -411,10 +411,10 @@ fun EditorScreen() {
                 horizontalArrangement = Arrangement.spacedBy(6.dp)
             ) {
                 palette.forEach { c ->
-                    val selected = !eraser && c == brushColor
+                    val selected = c == brushColor
                     Box(
                         modifier = Modifier
-                            .size(22.dp)
+                            .size(24.dp)
                             .clip(CircleShape)
                             .background(c)
                             .border(
@@ -424,7 +424,6 @@ fun EditorScreen() {
                             )
                             .clickable {
                                 brushColor = c
-                                eraser = false
                             }
                     )
                 }
@@ -452,6 +451,7 @@ fun EditorScreen() {
             }
         }
 
+        // ============ 画布 ============
         Box(
             modifier = Modifier
                 .weight(1f)
@@ -468,7 +468,7 @@ fun EditorScreen() {
                     contentScale = ContentScale.Fit,
                     modifier = Modifier
                         .fillMaxSize()
-                        .pointerInput(bitmap, eraser, brushColor, brushSizeDp) {
+                        .pointerInput(bitmap, brushColor, brushSizeDp) {
                             val bmp = bitmap ?: return@pointerInput
                             val bmpW = bmp.width.toFloat()
                             val bmpH = bmp.height.toFloat()
@@ -481,7 +481,7 @@ fun EditorScreen() {
                                     val (pt, s) = mapPoint(pos, size, bmpW, bmpH)
                                     last = pt
                                     strokeOnBitmap(
-                                        bmp, pt, pt, eraser,
+                                        bmp, pt, pt,
                                         brushColor.toArgb(), brushSizeDp.dp.toPx() / s
                                     )
                                     modified = true
@@ -495,12 +495,12 @@ fun EditorScreen() {
                                     val prev = last
                                     if (prev != null) {
                                         strokeOnBitmap(
-                                            bmp, prev, pt, eraser,
+                                            bmp, prev, pt,
                                             brushColor.toArgb(), brushSizeDp.dp.toPx() / s
                                         )
                                     } else {
                                         strokeOnBitmap(
-                                            bmp, pt, pt, eraser,
+                                            bmp, pt, pt,
                                             brushColor.toArgb(), brushSizeDp.dp.toPx() / s
                                         )
                                     }
@@ -520,6 +520,7 @@ fun EditorScreen() {
             }
         }
 
+        // ============ 状态栏 ============
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -543,6 +544,7 @@ fun EditorScreen() {
             }
         }
 
+        // ============ 底部按钮 ============
         Row(
             modifier = Modifier
                 .fillMaxWidth()
