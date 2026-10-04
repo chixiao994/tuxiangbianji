@@ -84,10 +84,8 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-/** 输入文件夹里的一张图片 */
 data class ImageItem(val uri: Uri, val name: String)
 
-/** 在 SAF 目录里按文件名找子文档 */
 private fun findChildUri(context: Context, treeUri: Uri, name: String): Uri? {
     try {
         val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(
@@ -112,7 +110,6 @@ private fun findChildUri(context: Context, treeUri: Uri, name: String): Uri? {
     return null
 }
 
-/** 列出目录下所有图片 */
 private suspend fun listImages(context: Context, treeUri: Uri): List<ImageItem> =
     withContext(Dispatchers.IO) {
         val result = mutableListOf<ImageItem>()
@@ -149,23 +146,20 @@ private suspend fun listImages(context: Context, treeUri: Uri): List<ImageItem> 
         result
     }
 
-/** 解码图片，最长边限制到 maxSize，返回可写的 ARGB_8888 Bitmap */
-private suspend fun loadBitmap(context: Context, uri: Uri, maxSize: Int = 2400): Bitmap? =
+/**
+ * 原分辨率加载图片，不做任何降采样，保证像素级无损。
+ * 配置强制 ARGB_8888，每个像素 32 位（含 alpha 通道），可安全用于字体制作。
+ * 支持读取 PNG 的透明通道。
+ */
+private suspend fun loadBitmap(context: Context, uri: Uri): Bitmap? =
     withContext(Dispatchers.IO) {
         try {
-            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-            context.contentResolver.openInputStream(uri)?.use {
-                BitmapFactory.decodeStream(it, null, bounds)
-            }
-            var sample = 1
-            if (bounds.outWidth > 0 && bounds.outHeight > 0) {
-                while (bounds.outWidth / sample > maxSize || bounds.outHeight / sample > maxSize) {
-                    sample *= 2
-                }
-            }
             val opts = BitmapFactory.Options().apply {
-                inSampleSize = sample
+                inSampleSize = 1
+                inScaled = false
                 inPreferredConfig = Bitmap.Config.ARGB_8888
+                inDither = false
+                inPremultiplied = false
             }
             val decoded = context.contentResolver.openInputStream(uri)?.use {
                 BitmapFactory.decodeStream(it, null, opts)
@@ -181,7 +175,6 @@ private suspend fun loadBitmap(context: Context, uri: Uri, maxSize: Int = 2400):
         }
     }
 
-/** 在 Bitmap 上画一段线；eraser = true 时擦成透明 */
 private fun strokeOnBitmap(
     bmp: Bitmap,
     from: Offset,
@@ -206,7 +199,6 @@ private fun strokeOnBitmap(
     canvas.drawLine(from.x, from.y, to.x, to.y, paint)
 }
 
-/** 把屏幕坐标转换成图片坐标（对应 ContentScale.Fit 的居中留白） */
 private fun mapPoint(
     p: Offset,
     viewSize: IntSize,
@@ -220,6 +212,43 @@ private fun mapPoint(
     val dx = (w - bmpW * s) / 2f
     val dy = (h - bmpH * s) / 2f
     return Offset((p.x - dx) / s, (p.y - dy) / s) to s
+}
+
+/**
+ * 把 Bitmap 无损写入输出文件夹。
+ * - 始终输出 PNG（无损压缩，像素零丢失，保留透明通道）
+ * - 不再合成白底，保留 alpha，方便字体制作时提取笔形轮廓
+ * - 文件名 = 原图名去扩展名 + .png，同名覆盖
+ */
+private suspend fun writeBitmapToOutput(
+    context: Context,
+    outTree: Uri,
+    bmp: Bitmap,
+    originalName: String
+): Boolean = withContext(Dispatchers.IO) {
+    try {
+        val fileName = originalName.substringBeforeLast('.', originalName) + ".png"
+
+        findChildUri(context, outTree, fileName)?.let { old ->
+            try {
+                DocumentsContract.deleteDocument(context.contentResolver, old)
+            } catch (_: Exception) {
+            }
+        }
+
+        val newDoc = DocumentsContract.createDocument(
+            context.contentResolver, outTree, "image/png", fileName
+        ) ?: return@withContext false
+
+        // 直接写原始 Bitmap，不做任何中间合成、不缩放、不转码
+        context.contentResolver.openOutputStream(newDoc, "w")?.use { os ->
+            bmp.compress(Bitmap.CompressFormat.PNG, 100, os)
+            os.flush()
+        }
+        true
+    } catch (_: Exception) {
+        false
+    }
 }
 
 @Composable
@@ -282,7 +311,6 @@ fun EditorScreen() {
         }
     }
 
-    // 读取输入文件夹图片列表
     LaunchedEffect(inputTree) {
         val t = inputTree ?: return@LaunchedEffect
         busy = true
@@ -294,71 +322,29 @@ fun EditorScreen() {
         status = if (list.isEmpty()) "该文件夹里没有图片" else "共 ${list.size} 张图片"
     }
 
-    // 切换图片时重新加载，并重置「已修改」状态
     LaunchedEffect(images, index) {
         val item = images.getOrNull(index)
         if (item == null) {
             bitmap = null
+            modified = false
             return@LaunchedEffect
         }
         busy = true
+        modified = false
         val b = loadBitmap(context, item.uri)
         bitmap = b
         modified = false
         version++
         busy = false
-        status = if (b == null) "加载失败：${item.name}" else "${index + 1}/${images.size}　${item.name}"
-    }
-
-    /**
-     * 保存当前图片到输出文件夹。
-     * 输出统一为 PNG，文件名 = 原名去扩展名 + .png，已存在则覆盖。
-     */
-    suspend fun saveCurrent(): Boolean {
-        val bmp = bitmap ?: return false
-        val outTree = outputTree ?: return false
-        val item = images.getOrNull(index) ?: return false
-
-        return withContext(Dispatchers.IO) {
-            try {
-                val fileName = item.name.substringBeforeLast('.', item.name) + ".png"
-
-                findChildUri(context, outTree, fileName)?.let { old ->
-                    try {
-                        DocumentsContract.deleteDocument(context.contentResolver, old)
-                    } catch (_: Exception) {
-                    }
-                }
-
-                val newDoc = DocumentsContract.createDocument(
-                    context.contentResolver, outTree, "image/png", fileName
-                ) ?: return@withContext false
-
-                // 把透明区域合成到白底，避免相册里显示成黑块
-                val flat = Bitmap.createBitmap(bmp.width, bmp.height, Bitmap.Config.ARGB_8888)
-                val c = AndroidCanvas(flat)
-                c.drawColor(AColor.WHITE)
-                c.drawBitmap(bmp, 0f, 0f, null)
-
-                context.contentResolver.openOutputStream(newDoc, "w")?.use { os ->
-                    flat.compress(Bitmap.CompressFormat.PNG, 100, os)
-                    os.flush()
-                }
-                flat.recycle()
-                true
-            } catch (_: Exception) {
-                false
-            }
+        status = if (b == null) {
+            "加载失败：${item.name}"
+        } else {
+            "${index + 1}/${images.size}　${item.name}　${b.width}×${b.height}"
         }
     }
 
-    /**
-     * 翻页。
-     * save = true  （上一张/下一张）：如果有修改就先保存
-     * save = false （跳过）        ：不保存，直接丢弃修改
-     */
     fun navigate(step: Int, save: Boolean) {
-        if (images.isEmpty()) return
+        if (images.isEmpty() || busy) return
         val target = index + step
         if (target < 0) {
             status = "已经是第一张了"
@@ -368,17 +354,30 @@ fun EditorScreen() {
             status = "已经是最后一张了"
             return
         }
+
+        val wasModified = modified
+        val currentBitmap = bitmap
+        val currentItem = images.getOrNull(index)
+
         scope.launch {
-            if (save && modified) {
+            if (save && wasModified && currentBitmap != null && currentItem != null) {
                 busy = true
                 if (outputTree == null) {
                     status = "未选择输出文件夹，本次修改未保存"
                 } else {
-                    val ok = saveCurrent()
-                    status = if (ok) "已保存修改" else "保存失败"
+                    val ok = writeBitmapToOutput(
+                        context, outputTree!!, currentBitmap, currentItem.name
+                    )
+                    status = if (ok) {
+                        "已保存：${currentItem.name.substringBeforeLast('.')}.png"
+                    } else {
+                        "保存失败"
+                    }
                 }
                 busy = false
             }
+
+            modified = false
             index = target
         }
     }
@@ -388,7 +387,6 @@ fun EditorScreen() {
             .fillMaxSize()
             .background(Color(0xFF101014))
     ) {
-        // ============ 顶部工具栏 ============
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -454,7 +452,6 @@ fun EditorScreen() {
             }
         }
 
-        // ============ 画布 ============
         Box(
             modifier = Modifier
                 .weight(1f)
@@ -523,7 +520,6 @@ fun EditorScreen() {
             }
         }
 
-        // ============ 状态栏 ============
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -547,7 +543,6 @@ fun EditorScreen() {
             }
         }
 
-        // ============ 底部按钮 ============
         Row(
             modifier = Modifier
                 .fillMaxWidth()
