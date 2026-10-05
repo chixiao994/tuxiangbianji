@@ -79,9 +79,19 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlin.math.roundToInt
 
+/**
+ * 图像在画布中的填充比例（占画布短边的百分比）。
+ * 0.62 = 图像占 62%，四周各留约 19% 的操作空间。
+ */
 private const val IMAGE_FILL_FACTOR = 0.62f
+
+/** 放大镜直径 */
 private val MAGNIFIER_SIZE = 140.dp
+
+/** 放大镜放大倍数 */
 private const val MAGNIFY_FACTOR = 3f
+
+/** 放大镜边缘与触摸点的间距 */
 private val MAGNIFIER_GAP = 70.dp
 
 class MainActivity : ComponentActivity() {
@@ -163,6 +173,9 @@ private suspend fun listImages(context: Context, treeUri: Uri): List<ImageItem> 
         result
     }
 
+/**
+ * 原分辨率加载图片，不做任何降采样，保证像素级无损。
+ */
 private suspend fun loadBitmap(context: Context, uri: Uri): Bitmap? =
     withContext(Dispatchers.IO) {
         try {
@@ -205,6 +218,10 @@ private fun strokeOnBitmap(
     canvas.drawLine(from.x, from.y, to.x, to.y, paint)
 }
 
+/**
+ * 把 Bitmap 无损写入输出文件夹。
+ * 始终输出 PNG（无损压缩，像素零丢失）。
+ */
 private suspend fun writeBitmapToOutput(
     context: Context,
     outTree: Uri,
@@ -255,6 +272,7 @@ fun EditorScreen() {
     var status by remember {
         mutableStateOf("① 点「输入」选图片文件夹　② 点「输出」选保存文件夹")
     }
+    // 手指触摸位置（画布坐标系），null 表示未触摸
     var touchPos by remember { mutableStateOf<Offset?>(null) }
 
     val palette = remember {
@@ -395,6 +413,7 @@ fun EditorScreen() {
             .statusBarsPadding()
             .navigationBarsPadding()
     ) {
+        // ============ 顶部工具栏 ============
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -466,6 +485,7 @@ fun EditorScreen() {
             }
         }
 
+        // ============ 画布 ============
         BoxWithConstraints(
             modifier = Modifier
                 .weight(1f)
@@ -490,6 +510,7 @@ fun EditorScreen() {
                 val originX = (canvasW - displayW) / 2f
                 val originY = (canvasH - displayH) / 2f
 
+                // ---- 图像显示 ----
                 Image(
                     bitmap = imgBitmap,
                     contentDescription = null,
@@ -500,6 +521,7 @@ fun EditorScreen() {
                     )
                 )
 
+                // ---- 触摸交互层 ----
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
@@ -567,12 +589,14 @@ fun EditorScreen() {
                         }
                 )
 
+                // ---- 触摸位置圆点标记 + 放大镜 ----
                 val tp = touchPos
                 if (tp != null) {
                     val magRadiusPx = with(density) { (MAGNIFIER_SIZE / 2).toPx() }
                     val magGapPx = with(density) { MAGNIFIER_GAP.toPx() }
                     val markRadiusPx = with(density) { (brushSizeDp / 2).dp.toPx() }
 
+                    // 1. 主画布上的半透明圆点标记
                     Canvas(modifier = Modifier.fillMaxSize()) {
                         drawCircle(
                             color = brushColor.copy(alpha = 0.45f),
@@ -592,18 +616,21 @@ fun EditorScreen() {
                         )
                     }
 
-                    val magCx = tp.x.coerceIn(magRadiusPx, canvasW - magRadiusPx)
-                    val magCy = if (tp.y > canvasH / 2f) {
-                        (tp.y - magGapPx - magRadiusPx).coerceAtLeast(magRadiusPx)
-                    } else {
-                        (tp.y + magGapPx + magRadiusPx).coerceAtMost(canvasH - magRadiusPx)
-                    }
+                    // 2. 放大镜固定放在触摸点的左上方；越界时贴边
+                    val desiredCx = tp.x - magGapPx - magRadiusPx
+                    val desiredCy = tp.y - magGapPx - magRadiusPx
+                    val maxCx = (canvasW - magRadiusPx).coerceAtLeast(magRadiusPx)
+                    val maxCy = (canvasH - magRadiusPx).coerceAtLeast(magRadiusPx)
+                    val magCx = desiredCx.coerceIn(magRadiusPx, maxCx)
+                    val magCy = desiredCy.coerceIn(magRadiusPx, maxCy)
 
+                    // 触摸点在图片坐标系里的位置
                     val imgPos = Offset(
                         (tp.x - originX) / displayScale,
                         (tp.y - originY) / displayScale
                     )
 
+                    // 3. 放大镜本体
                     Box(
                         modifier = Modifier
                             .absoluteOffset {
@@ -665,7 +692,9 @@ fun EditorScreen() {
                                     )
                                 }
 
-                                val magMarkRadius = brushSizeDp * density.density * MAGNIFY_FACTOR / 2f
+                                // 放大镜内的圆点标记
+                                val magMarkRadius =
+                                    brushSizeDp * density.density * MAGNIFY_FACTOR / 2f
                                 val center = Offset(size.width / 2f, size.height / 2f)
 
                                 drawCircle(
@@ -686,6 +715,7 @@ fun EditorScreen() {
                                 )
                             }
 
+                            // 外圈边框
                             drawCircle(
                                 color = Color.White,
                                 radius = size.minDimension / 2f - 1f,
@@ -703,6 +733,7 @@ fun EditorScreen() {
             }
         }
 
+        // ============ 状态栏 ============
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -726,6 +757,7 @@ fun EditorScreen() {
             }
         }
 
+        // ============ 底部按钮 ============
         Row(
             modifier = Modifier
                 .fillMaxWidth()
