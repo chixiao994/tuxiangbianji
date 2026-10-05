@@ -81,9 +81,11 @@ import kotlin.math.roundToInt
 
 /**
  * 图像在画布中的填充比例（占画布短边的百分比）。
- * 0.62 = 图像占 62%，四周各留约 19% 的操作空间。
+ * 0.82 = 图像占 82%，四周各留约 9% 的操作空间。
+ * 数值越小，图像显示越小，四周留白越多；
+ * 数值越大，图像显示越大，四周留白越少。
  */
-private const val IMAGE_FILL_FACTOR = 0.62f
+private const val IMAGE_FILL_FACTOR = 0.82f
 
 /** 放大镜直径 */
 private val MAGNIFIER_SIZE = 140.dp
@@ -510,18 +512,20 @@ fun EditorScreen() {
                 val originX = (canvasW - displayW) / 2f
                 val originY = (canvasH - displayH) / 2f
 
-                // ---- 图像显示 ----
+                // ---- 图像显示（居中） ----
                 Image(
                     bitmap = imgBitmap,
                     contentDescription = null,
                     contentScale = ContentScale.Fit,
-                    modifier = Modifier.size(
-                        width = with(density) { displayW.toDp() },
-                        height = with(density) { displayH.toDp() }
-                    )
+                    modifier = Modifier
+                        .align(Alignment.Center)
+                        .size(
+                            width = with(density) { displayW.toDp() },
+                            height = with(density) { displayH.toDp() }
+                        )
                 )
 
-                // ---- 触摸交互层 ----
+                // ---- 触摸交互层（覆盖整个画布） ----
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
@@ -597,7 +601,11 @@ fun EditorScreen() {
                     val markRadiusPx = with(density) { (brushSizeDp / 2).dp.toPx() }
 
                     // 1. 主画布上的半透明圆点标记
-                    Canvas(modifier = Modifier.fillMaxSize()) {
+                    Canvas(
+                        modifier = Modifier
+                            .align(Alignment.TopStart)
+                            .fillMaxSize()
+                    ) {
                         drawCircle(
                             color = brushColor.copy(alpha = 0.45f),
                             radius = markRadiusPx,
@@ -616,7 +624,9 @@ fun EditorScreen() {
                         )
                     }
 
-                    // 2. 放大镜固定放在触摸点的左上方；越界时贴边
+                    // 2. 放大镜固定放在触摸点的左上方；越界时贴边。
+                    //    注意：外层 BoxWithConstraints 是 Center 对齐，
+                    //    所以放大镜必须显式用 TopStart 对齐，让 absoluteOffset 从左上角算起。
                     val desiredCx = tp.x - magGapPx - magRadiusPx
                     val desiredCy = tp.y - magGapPx - magRadiusPx
                     val maxCx = (canvasW - magRadiusPx).coerceAtLeast(magRadiusPx)
@@ -633,6 +643,7 @@ fun EditorScreen() {
                     // 3. 放大镜本体
                     Box(
                         modifier = Modifier
+                            .align(Alignment.TopStart)
                             .absoluteOffset {
                                 IntOffset(
                                     (magCx - magRadiusPx).roundToInt(),
