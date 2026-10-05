@@ -14,6 +14,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -26,6 +27,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
+import androidx.compose.foundation.layout.absoluteOffset
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -55,26 +57,42 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.FilterQuality
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.clipPath
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlin.math.roundToInt
 
 /**
  * 图像在画布中的填充比例（占画布短边的百分比）。
  * 0.62 = 图像占 62%，四周各留约 19% 的操作空间。
- * 数值越小，图像显示越小，四周留白越多，越方便擦除/补画边缘。
  */
 private const val IMAGE_FILL_FACTOR = 0.62f
+
+/** 放大镜直径 */
+private val MAGNIFIER_SIZE = 140.dp
+
+/** 放大镜放大倍数 */
+private const val MAGNIFY_FACTOR = 3f
+
+/** 放大镜边缘与触摸点的间距 */
+private val MAGNIFIER_GAP = 70.dp
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -155,9 +173,7 @@ private suspend fun listImages(context: Context, treeUri: Uri): List<ImageItem> 
         result
     }
 
-/**
- * 原分辨率加载图片，不做任何降采样，保证像素级无损。
- */
+/** 原分辨率加载图片，不做任何降采样，保证像素级无损。 */
 private suspend fun loadBitmap(context: Context, uri: Uri): Bitmap? =
     withContext(Dispatchers.IO) {
         try {
@@ -200,10 +216,7 @@ private fun strokeOnBitmap(
     canvas.drawLine(from.x, from.y, to.x, to.y, paint)
 }
 
-/**
- * 把 Bitmap 无损写入输出文件夹。
- * 始终输出 PNG（无损压缩，像素零丢失）。
- */
+/** 把 Bitmap 无损写入输出文件夹。始终输出 PNG。 */
 private suspend fun writeBitmapToOutput(
     context: Context,
     outTree: Uri,
@@ -253,6 +266,8 @@ fun EditorScreen() {
     var status by remember {
         mutableStateOf("① 点「输入」选图片文件夹　② 点「输出」选保存文件夹")
     }
+    // 手指触摸位置（画布坐标系），null 表示未触摸
+    var touchPos by remember { mutableStateOf<Offset?>(null) }
 
     val palette = remember {
         listOf(
@@ -464,7 +479,7 @@ fun EditorScreen() {
             }
         }
 
-        // ============ 画布（图像居中，四周留白） ============
+        // ============ 画布 ============
         BoxWithConstraints(
             modifier = Modifier
                 .weight(1f)
@@ -473,74 +488,91 @@ fun EditorScreen() {
             contentAlignment = Alignment.Center
         ) {
             val density = LocalDensity.current
-            val containerW = with(density) { maxWidth.toPx() }
-            val containerH = with(density) { maxHeight.toPx() }
+            val canvasW = with(density) { maxWidth.toPx() }
+            val canvasH = with(density) { maxHeight.toPx() }
 
             val bmp = bitmap
             val imgBitmap = remember(bitmap, version) { bitmap?.asImageBitmap() }
 
-            if (bmp != null && imgBitmap != null && containerW > 0f && containerH > 0f) {
+            if (bmp != null && imgBitmap != null && canvasW > 0f && canvasH > 0f) {
                 val bmpW = bmp.width.toFloat()
                 val bmpH = bmp.height.toFloat()
 
-                // 先按容器 Fit 得到基准缩放，再乘填充比例，形成四周留白
-                val fitScale = minOf(containerW / bmpW, containerH / bmpH)
+                val fitScale = minOf(canvasW / bmpW, canvasH / bmpH)
                 val displayScale = fitScale * IMAGE_FILL_FACTOR
                 val displayW = (bmpW * displayScale).coerceAtLeast(1f)
                 val displayH = (bmpH * displayScale).coerceAtLeast(1f)
+                val originX = (canvasW - displayW) / 2f
+                val originY = (canvasH - displayH) / 2f
 
+                // ---- 图像显示 ----
                 Image(
                     bitmap = imgBitmap,
                     contentDescription = null,
                     contentScale = ContentScale.Fit,
+                    modifier = Modifier.size(
+                        width = with(density) { displayW.toDp() },
+                        height = with(density) { displayH.toDp() }
+                    )
+                )
+
+                // ---- 触摸交互层（覆盖整个画布） ----
+                Box(
                     modifier = Modifier
-                        .size(
-                            width = with(density) { displayW.toDp() },
-                            height = with(density) { displayH.toDp() }
-                        )
+                        .fillMaxSize()
                         .pointerInput(bmp, brushColor, brushSizeDp) {
                             val bW = bmp.width.toFloat()
                             val bH = bmp.height.toFloat()
                             if (bW <= 0f || bH <= 0f) return@pointerInput
-                            val viewW = size.width.toFloat()
-                            val viewH = size.height.toFloat()
-                            if (viewW <= 0f || viewH <= 0f) return@pointerInput
+                            val vw = size.width.toFloat()
+                            val vh = size.height.toFloat()
+                            if (vw <= 0f || vh <= 0f) return@pointerInput
 
-                            // Image 的实际尺寸就是缩放后的显示尺寸，
-                            // 因此图片坐标 = 屏幕坐标 / s
-                            val s = viewW / bW
+                            val oX = (vw - displayW) / 2f
+                            val oY = (vh - displayH) / 2f
+
+                            fun toImg(p: Offset) =
+                                Offset((p.x - oX) / displayScale, (p.y - oY) / displayScale)
 
                             var last: Offset? = null
 
                             detectDragGestures(
                                 onDragStart = { pos ->
-                                    val pt = Offset(pos.x / s, pos.y / s)
+                                    touchPos = pos
+                                    val pt = toImg(pos)
                                     last = pt
                                     strokeOnBitmap(
                                         bmp, pt, pt,
                                         brushColor.toArgb(),
-                                        brushSizeDp.dp.toPx() / s
+                                        brushSizeDp.dp.toPx() / displayScale
                                     )
                                     modified = true
                                     version++
                                 },
-                                onDragEnd = { last = null },
-                                onDragCancel = { last = null },
+                                onDragEnd = {
+                                    last = null
+                                    touchPos = null
+                                },
+                                onDragCancel = {
+                                    last = null
+                                    touchPos = null
+                                },
                                 onDrag = { change, _ ->
                                     change.consume()
-                                    val pt = Offset(change.position.x / s, change.position.y / s)
+                                    touchPos = change.position
+                                    val pt = toImg(change.position)
                                     val prev = last
                                     if (prev != null) {
                                         strokeOnBitmap(
                                             bmp, prev, pt,
                                             brushColor.toArgb(),
-                                            brushSizeDp.dp.toPx() / s
+                                            brushSizeDp.dp.toPx() / displayScale
                                         )
                                     } else {
                                         strokeOnBitmap(
                                             bmp, pt, pt,
                                             brushColor.toArgb(),
-                                            brushSizeDp.dp.toPx() / s
+                                            brushSizeDp.dp.toPx() / displayScale
                                         )
                                     }
                                     last = pt
@@ -550,6 +582,149 @@ fun EditorScreen() {
                             )
                         }
                 )
+
+                // ---- 触摸位置圆点标记 + 放大镜 ----
+                val tp = touchPos
+                if (tp != null) {
+                    val magRadiusPx = with(density) { (MAGNIFIER_SIZE / 2).toPx() }
+                    val magGapPx = with(density) { MAGNIFIER_GAP.toPx() }
+                    // 屏幕上圆点直径 = 笔刷屏幕直径（brushSizeDp）
+                    val markRadiusPx = brushSizeDp.dp.toPx() / 2f
+
+                    // 1. 主画布上的半透明圆点标记
+                    Canvas(modifier = Modifier.fillMaxSize()) {
+                        // 半透明填充，颜色跟随笔刷色
+                        drawCircle(
+                            color = brushColor.copy(alpha = 0.45f),
+                            radius = markRadiusPx,
+                            center = tp
+                        )
+                        // 红色描边，确保任何底色上都清晰可见
+                        drawCircle(
+                            color = Color(0xFFFF2222),
+                            radius = markRadiusPx,
+                            center = tp,
+                            style = Stroke(width = 1.5.dp.toPx())
+                        )
+                        // 中心 1px 小点，指示精确落点
+                        drawCircle(
+                            color = Color(0xFFFF2222),
+                            radius = 1.5.dp.toPx(),
+                            center = tp
+                        )
+                    }
+
+                    // 2. 放大镜位置：默认在触摸点上方，空间不足则放下方
+                    val magCx = tp.x.coerceIn(magRadiusPx, canvasW - magRadiusPx)
+                    val magCy = if (tp.y > canvasH / 2f) {
+                        (tp.y - magGapPx - magRadiusPx).coerceAtLeast(magRadiusPx)
+                    } else {
+                        (tp.y + magGapPx + magRadiusPx).coerceAtMost(canvasH - magRadiusPx)
+                    }
+
+                    // 触摸点在图片坐标系里的位置
+                    val imgPos = Offset(
+                        (tp.x - originX) / displayScale,
+                        (tp.y - originY) / displayScale
+                    )
+
+                    // 3. 放大镜本体
+                    Box(
+                        modifier = Modifier
+                            .absoluteOffset {
+                                IntOffset(
+                                    (magCx - magRadiusPx).roundToInt(),
+                                    (magCy - magRadiusPx).roundToInt()
+                                )
+                            }
+                            .size(MAGNIFIER_SIZE)
+                    ) {
+                        Canvas(modifier = Modifier.fillMaxSize()) {
+                            val circlePath = Path().apply {
+                                addOval(Rect(0f, 0f, size.width, size.height))
+                            }
+
+                            clipPath(circlePath) {
+                                // 先铺底，图像边缘处显示背景色
+                                drawRect(color = Color(0xFF14141A))
+
+                                // 计算要绘制的原图区域
+                                val srcSize = size.width / (displayScale * MAGNIFY_FACTOR)
+
+                                val srcLeft = imgPos.x - srcSize / 2f
+                                val srcTop = imgPos.y - srcSize / 2f
+
+                                val leftClip = if (srcLeft < 0f) -srcLeft else 0f
+                                val topClip = if (srcTop < 0f) -srcTop else 0f
+                                val rightClip =
+                                    if (srcLeft + srcSize > bmpW) srcLeft + srcSize - bmpW else 0f
+                                val bottomClip =
+                                    if (srcTop + srcSize > bmpH) srcTop + srcSize - bmpH else 0f
+
+                                val actualSrcLeft =
+                                    (srcLeft + leftClip).toInt().coerceAtLeast(0)
+                                val actualSrcTop =
+                                    (srcTop + topClip).toInt().coerceAtLeast(0)
+                                val actualSrcW =
+                                    (srcSize - leftClip - rightClip).toInt().coerceAtLeast(1)
+                                val actualSrcH =
+                                    (srcSize - topClip - bottomClip).toInt().coerceAtLeast(1)
+
+                                val safeW =
+                                    actualSrcW.coerceAtMost(bmp.width - actualSrcLeft)
+                                val safeH =
+                                    actualSrcH.coerceAtMost(bmp.height - actualSrcTop)
+
+                                if (safeW > 0 && safeH > 0) {
+                                    val pxPerSrc = size.width / srcSize
+                                    val dstLeft = (leftClip * pxPerSrc).toInt()
+                                    val dstTop = (topClip * pxPerSrc).toInt()
+                                    val dstW = (safeW * pxPerSrc).toInt()
+                                    val dstH = (safeH * pxPerSrc).toInt()
+
+                                    drawImage(
+                                        image = imgBitmap,
+                                        srcOffset = IntOffset(actualSrcLeft, actualSrcTop),
+                                        srcSize = IntSize(safeW, safeH),
+                                        dstOffset = IntOffset(dstLeft, dstTop),
+                                        dstSize = IntSize(dstW, dstH),
+                                        filterQuality = FilterQuality.None
+                                    )
+                                }
+
+                                // 放大镜内的圆点标记：
+                                // 屏幕上 1 个像素在放大镜里放大 MAGNIFY_FACTOR 倍
+                                val magMarkRadius =
+                                    brushSizeDp.dp.toPx() * MAGNIFY_FACTOR / 2f
+                                val center = Offset(size.width / 2f, size.height / 2f)
+
+                                drawCircle(
+                                    color = brushColor.copy(alpha = 0.45f),
+                                    radius = magMarkRadius,
+                                    center = center
+                                )
+                                drawCircle(
+                                    color = Color(0xFFFF2222),
+                                    radius = magMarkRadius,
+                                    center = center,
+                                    style = Stroke(width = 1.5.dp.toPx())
+                                )
+                                drawCircle(
+                                    color = Color(0xFFFF2222),
+                                    radius = 1.5.dp.toPx(),
+                                    center = center
+                                )
+                            }
+
+                            // 外圈边框
+                            drawCircle(
+                                color = Color.White,
+                                radius = size.minDimension / 2f - 1f,
+                                style = Stroke(width = 2.dp.toPx())
+                            )
+                        }
+                    }
+                }
             } else {
                 Text(
                     text = if (busy) "加载中…" else "请选择输入文件夹",
