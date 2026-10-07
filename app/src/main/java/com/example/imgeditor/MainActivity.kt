@@ -113,11 +113,21 @@ class MainActivity : ComponentActivity() {
 
 data class ImageItem(val uri: Uri, val name: String)
 
+/**
+ * 把 tree URI 转换为目录本身的 document URI。
+ * createDocument / deleteDocument 等 API 需要的是 document URI，
+ * 直接传 tree URI 会在部分设备上抛出 "Invalid URI"。
+ */
+private fun treeToDocumentUri(treeUri: Uri): Uri {
+    val treeDocId = DocumentsContract.getTreeDocumentId(treeUri)
+    return DocumentsContract.buildDocumentUriUsingTree(treeUri, treeDocId)
+}
+
+/** 在 SAF 目录里按文件名找子文档（返回 document URI） */
 private fun findChildUri(context: Context, treeUri: Uri, name: String): Uri? {
     try {
-        val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(
-            treeUri, DocumentsContract.getTreeDocumentId(treeUri)
-        )
+        val treeDocId = DocumentsContract.getTreeDocumentId(treeUri)
+        val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, treeDocId)
         context.contentResolver.query(
             childrenUri,
             arrayOf(
@@ -141,9 +151,9 @@ private suspend fun listImages(context: Context, treeUri: Uri): List<ImageItem> 
     withContext(Dispatchers.IO) {
         val result = mutableListOf<ImageItem>()
         try {
-            val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(
-                treeUri, DocumentsContract.getTreeDocumentId(treeUri)
-            )
+            val treeDocId = DocumentsContract.getTreeDocumentId(treeUri)
+            val childrenUri =
+                DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, treeDocId)
             context.contentResolver.query(
                 childrenUri,
                 arrayOf(
@@ -239,21 +249,36 @@ private suspend fun writeBitmapToOutput(
 
         val fileName = originalName.substringBeforeLast('.', originalName) + ".png"
 
-        // 删除同名旧文件，避免不同设备上 createDocument 自动改名或失败
-        findChildUri(context, outTree, fileName)?.let { old ->
-            try {
-                DocumentsContract.deleteDocument(context.contentResolver, old)
-            } catch (_: Exception) {
-                // 删除失败不致命，继续尝试创建
-            }
+        // ★ 关键修复：createDocument 需要 parent document URI，不是 tree URI。
+        val parentDocUri = try {
+            treeToDocumentUri(outTree)
+        } catch (e: Exception) {
+            return@withContext "无法解析输出文件夹：${e.message ?: e.javaClass.simpleName}"
         }
 
-        val newDoc = DocumentsContract.createDocument(
-            context.contentResolver, outTree, "image/png", fileName
-        ) ?: return@withContext "无法创建文件 $fileName（可能无写入权限）"
+        // 处理同名文件：优先删除，删除失败则直接覆盖写入
+        val existing = findChildUri(context, outTree, fileName)
+        val targetDoc: Uri = if (existing != null) {
+            val deleted = try {
+                DocumentsContract.deleteDocument(context.contentResolver, existing)
+            } catch (_: Exception) {
+                false
+            }
+            if (deleted) {
+                DocumentsContract.createDocument(
+                    context.contentResolver, parentDocUri, "image/png", fileName
+                ) ?: return@withContext "无法创建文件 $fileName"
+            } else {
+                // 删除失败，直接用原 document URI 覆盖写入
+                existing
+            }
+        } else {
+            DocumentsContract.createDocument(
+                context.contentResolver, parentDocUri, "image/png", fileName
+            ) ?: return@withContext "无法创建文件 $fileName（可能无写入权限）"
+        }
 
-        // 关键修复：openOutputStream 为 null 时直接失败，不再误报成功
-        val os = context.contentResolver.openOutputStream(newDoc, "w")
+        val os = context.contentResolver.openOutputStream(targetDoc, "w")
             ?: return@withContext "无法打开输出流 $fileName"
 
         val compressed = os.use { stream ->
@@ -266,10 +291,10 @@ private suspend fun writeBitmapToOutput(
             return@withContext "PNG 编码失败 $fileName"
         }
 
-        // 二次验证：查询文件大小，确保真的写入成功
+        // 二次验证：查询文件大小
         val size = try {
             context.contentResolver.query(
-                newDoc,
+                targetDoc,
                 arrayOf(DocumentsContract.Document.COLUMN_SIZE),
                 null, null, null
             )?.use { c ->
@@ -307,14 +332,10 @@ fun EditorScreen() {
     var brushSizeDp by remember { mutableFloatStateOf(16f) }
     var busy by remember { mutableStateOf(false) }
 
-    // 操作结果显示（保存成功/失败等）
     var actionStatus by remember {
         mutableStateOf("① 点「输入」选图片文件夹　② 点「输出」选保存文件夹")
     }
-    // 图片信息显示（序号、文件名、尺寸）
     var imageInfo by remember { mutableStateOf("") }
-
-    // 手指触摸位置（画布坐标系），null 表示未触摸
     var touchPos by remember { mutableStateOf<Offset?>(null) }
 
     val palette = remember {
@@ -391,11 +412,6 @@ fun EditorScreen() {
         }
     }
 
-    /**
-     * 翻页。
-     * save = true  （上一张/下一张）：如果当前图有修改，先保存再翻页
-     * save = false （跳过）        ：不保存，直接丢弃当前图的修改
-     */
     fun navigate(step: Int, save: Boolean) {
         if (images.isEmpty()) return
         if (busy) {
@@ -413,13 +429,11 @@ fun EditorScreen() {
             return
         }
 
-        // 在协程启动前捕获所有需要的状态，避免异步过程中被覆盖
         val wasModified = modified
         val savedBitmap = bitmap
         val savedItem = images.getOrNull(index)
         val needSave = save && wasModified && savedBitmap != null && savedItem != null
 
-        // 立即设置 busy，防止连点
         if (needSave) busy = true
 
         scope.launch {
@@ -471,7 +485,6 @@ fun EditorScreen() {
             .statusBarsPadding()
             .navigationBarsPadding()
     ) {
-        // ============ 顶部工具栏 ============
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -543,7 +556,6 @@ fun EditorScreen() {
             }
         }
 
-        // ============ 画布 ============
         BoxWithConstraints(
             modifier = Modifier
                 .weight(1f)
@@ -568,7 +580,6 @@ fun EditorScreen() {
                 val originX = (canvasW - displayW) / 2f
                 val originY = (canvasH - displayH) / 2f
 
-                // ---- 图像显示（居中） ----
                 Image(
                     bitmap = imgBitmap,
                     contentDescription = null,
@@ -581,7 +592,6 @@ fun EditorScreen() {
                         )
                 )
 
-                // ---- 触摸交互层（覆盖整个画布） ----
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
@@ -649,14 +659,12 @@ fun EditorScreen() {
                         }
                 )
 
-                // ---- 触摸位置圆点标记 + 放大镜 ----
                 val tp = touchPos
                 if (tp != null) {
                     val magRadiusPx = with(density) { (MAGNIFIER_SIZE / 2).toPx() }
                     val magGapPx = with(density) { MAGNIFIER_GAP.toPx() }
                     val markRadiusPx = with(density) { (brushSizeDp / 2).dp.toPx() }
 
-                    // 1. 主画布上的半透明圆点标记
                     Canvas(
                         modifier = Modifier
                             .align(Alignment.TopStart)
@@ -680,7 +688,6 @@ fun EditorScreen() {
                         )
                     }
 
-                    // 2. 放大镜固定放在触摸点的左上方；越界时贴边
                     val desiredCx = tp.x - magGapPx - magRadiusPx
                     val desiredCy = tp.y - magGapPx - magRadiusPx
                     val maxCx = (canvasW - magRadiusPx).coerceAtLeast(magRadiusPx)
@@ -688,13 +695,11 @@ fun EditorScreen() {
                     val magCx = desiredCx.coerceIn(magRadiusPx, maxCx)
                     val magCy = desiredCy.coerceIn(magRadiusPx, maxCy)
 
-                    // 触摸点在图片坐标系里的位置
                     val imgPos = Offset(
                         (tp.x - originX) / displayScale,
                         (tp.y - originY) / displayScale
                     )
 
-                    // 3. 放大镜本体
                     Box(
                         modifier = Modifier
                             .align(Alignment.TopStart)
@@ -757,7 +762,6 @@ fun EditorScreen() {
                                     )
                                 }
 
-                                // 放大镜内的圆点标记
                                 val magMarkRadius =
                                     brushSizeDp * density.density * MAGNIFY_FACTOR / 2f
                                 val center = Offset(size.width / 2f, size.height / 2f)
@@ -780,7 +784,6 @@ fun EditorScreen() {
                                 )
                             }
 
-                            // 外圈边框
                             drawCircle(
                                 color = Color.White,
                                 radius = size.minDimension / 2f - 1f,
@@ -798,7 +801,6 @@ fun EditorScreen() {
             }
         }
 
-        // ============ 状态栏（两行：操作结果 + 图片信息） ============
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -832,7 +834,6 @@ fun EditorScreen() {
             }
         }
 
-        // ============ 底部按钮 ============
         Row(
             modifier = Modifier
                 .fillMaxWidth()
