@@ -82,8 +82,6 @@ import kotlin.math.roundToInt
 /**
  * 图像在画布中的填充比例（占画布短边的百分比）。
  * 0.82 = 图像占 82%，四周各留约 9% 的操作空间。
- * 数值越小，图像显示越小，四周留白越多；
- * 数值越大，图像显示越大，四周留白越少。
  */
 private const val IMAGE_FILL_FACTOR = 0.82f
 
@@ -223,34 +221,71 @@ private fun strokeOnBitmap(
 /**
  * 把 Bitmap 无损写入输出文件夹。
  * 始终输出 PNG（无损压缩，像素零丢失）。
+ *
+ * 返回值：
+ * - 空字符串 ""   表示保存成功
+ * - 非空字符串    表示失败原因，方便在状态栏显示
  */
 private suspend fun writeBitmapToOutput(
     context: Context,
     outTree: Uri,
     bmp: Bitmap,
     originalName: String
-): Boolean = withContext(Dispatchers.IO) {
+): String = withContext(Dispatchers.IO) {
     try {
+        if (bmp.isRecycled) {
+            return@withContext "图像已被回收"
+        }
+
         val fileName = originalName.substringBeforeLast('.', originalName) + ".png"
 
+        // 删除同名旧文件，避免不同设备上 createDocument 自动改名或失败
         findChildUri(context, outTree, fileName)?.let { old ->
             try {
                 DocumentsContract.deleteDocument(context.contentResolver, old)
             } catch (_: Exception) {
+                // 删除失败不致命，继续尝试创建
             }
         }
 
         val newDoc = DocumentsContract.createDocument(
             context.contentResolver, outTree, "image/png", fileName
-        ) ?: return@withContext false
+        ) ?: return@withContext "无法创建文件 $fileName（可能无写入权限）"
 
-        context.contentResolver.openOutputStream(newDoc, "w")?.use { os ->
-            bmp.compress(Bitmap.CompressFormat.PNG, 100, os)
-            os.flush()
+        // 关键修复：openOutputStream 为 null 时直接失败，不再误报成功
+        val os = context.contentResolver.openOutputStream(newDoc, "w")
+            ?: return@withContext "无法打开输出流 $fileName"
+
+        val compressed = os.use { stream ->
+            val ok = bmp.compress(Bitmap.CompressFormat.PNG, 100, stream)
+            stream.flush()
+            ok
         }
-        true
-    } catch (_: Exception) {
-        false
+
+        if (!compressed) {
+            return@withContext "PNG 编码失败 $fileName"
+        }
+
+        // 二次验证：查询文件大小，确保真的写入成功
+        val size = try {
+            context.contentResolver.query(
+                newDoc,
+                arrayOf(DocumentsContract.Document.COLUMN_SIZE),
+                null, null, null
+            )?.use { c ->
+                if (c.moveToFirst() && !c.isNull(0)) c.getLong(0) else -1L
+            } ?: -1L
+        } catch (_: Exception) {
+            -1L
+        }
+
+        if (size <= 0L) {
+            return@withContext "文件写入为空 $fileName"
+        }
+
+        ""  // 成功
+    } catch (e: Exception) {
+        "保存异常：${e.message ?: e.javaClass.simpleName}"
     }
 }
 
@@ -271,9 +306,14 @@ fun EditorScreen() {
     var brushColor by remember { mutableStateOf(Color.Black) }
     var brushSizeDp by remember { mutableFloatStateOf(16f) }
     var busy by remember { mutableStateOf(false) }
-    var status by remember {
+
+    // 操作结果显示（保存成功/失败等）
+    var actionStatus by remember {
         mutableStateOf("① 点「输入」选图片文件夹　② 点「输出」选保存文件夹")
     }
+    // 图片信息显示（序号、文件名、尺寸）
+    var imageInfo by remember { mutableStateOf("") }
+
     // 手指触摸位置（画布坐标系），null 表示未触摸
     var touchPos by remember { mutableStateOf<Offset?>(null) }
 
@@ -314,19 +354,19 @@ fun EditorScreen() {
             } catch (_: Exception) {
             }
             outputTree = uri
-            status = "输出文件夹已设置，修改后翻页会自动保存"
+            actionStatus = "输出文件夹已设置，修改后翻页会自动保存"
         }
     }
 
     LaunchedEffect(inputTree) {
         val t = inputTree ?: return@LaunchedEffect
         busy = true
-        status = "正在读取图片列表…"
+        actionStatus = "正在读取图片列表…"
         val list = listImages(context, t)
         images = list
         index = 0
         busy = false
-        status = if (list.isEmpty()) "该文件夹里没有图片" else "共 ${list.size} 张图片"
+        actionStatus = if (list.isEmpty()) "该文件夹里没有图片" else "共 ${list.size} 张图片"
     }
 
     LaunchedEffect(images, index) {
@@ -334,6 +374,7 @@ fun EditorScreen() {
         if (item == null) {
             bitmap = null
             modified = false
+            imageInfo = ""
             return@LaunchedEffect
         }
         busy = true
@@ -343,42 +384,56 @@ fun EditorScreen() {
         modified = false
         version++
         busy = false
-        status = if (b == null) {
+        imageInfo = if (b == null) {
             "加载失败：${item.name}"
         } else {
             "${index + 1}/${images.size}　${item.name}　${b.width}×${b.height}"
         }
     }
 
+    /**
+     * 翻页。
+     * save = true  （上一张/下一张）：如果当前图有修改，先保存再翻页
+     * save = false （跳过）        ：不保存，直接丢弃当前图的修改
+     */
     fun navigate(step: Int, save: Boolean) {
-        if (images.isEmpty() || busy) return
+        if (images.isEmpty()) return
+        if (busy) {
+            actionStatus = "正在处理，请稍候…"
+            return
+        }
+
         val target = index + step
         if (target < 0) {
-            status = "已经是第一张了"
+            actionStatus = "已经是第一张了"
             return
         }
         if (target >= images.size) {
-            status = "已经是最后一张了"
+            actionStatus = "已经是最后一张了"
             return
         }
 
+        // 在协程启动前捕获所有需要的状态，避免异步过程中被覆盖
         val wasModified = modified
-        val currentBitmap = bitmap
-        val currentItem = images.getOrNull(index)
+        val savedBitmap = bitmap
+        val savedItem = images.getOrNull(index)
+        val needSave = save && wasModified && savedBitmap != null && savedItem != null
+
+        // 立即设置 busy，防止连点
+        if (needSave) busy = true
 
         scope.launch {
-            if (save && wasModified && currentBitmap != null && currentItem != null) {
-                busy = true
+            if (needSave && savedBitmap != null && savedItem != null) {
                 if (outputTree == null) {
-                    status = "未选择输出文件夹，本次修改未保存"
+                    actionStatus = "⚠ 未选择输出文件夹，本次修改未保存"
                 } else {
-                    val ok = writeBitmapToOutput(
-                        context, outputTree!!, currentBitmap, currentItem.name
+                    val err = writeBitmapToOutput(
+                        context, outputTree!!, savedBitmap, savedItem.name
                     )
-                    status = if (ok) {
-                        "已保存：${currentItem.name.substringBeforeLast('.')}.png"
+                    actionStatus = if (err.isEmpty()) {
+                        "✓ 已保存：${savedItem.name.substringBeforeLast('.')}.png"
                     } else {
-                        "保存失败"
+                        "✗ 保存失败：$err"
                     }
                 }
                 busy = false
@@ -394,17 +449,18 @@ fun EditorScreen() {
         val item = images.getOrNull(index) ?: return
         scope.launch {
             busy = true
-            status = "正在重置…"
+            actionStatus = "正在重置…"
             val b = loadBitmap(context, item.uri)
             bitmap = b
             modified = false
             version++
             busy = false
-            status = if (b == null) {
+            imageInfo = if (b == null) {
                 "重置失败：${item.name}"
             } else {
-                "已重置：${item.name}　${b.width}×${b.height}"
+                "${index + 1}/${images.size}　${item.name}　${b.width}×${b.height}"
             }
+            actionStatus = "已重置：${item.name}"
         }
     }
 
@@ -624,9 +680,7 @@ fun EditorScreen() {
                         )
                     }
 
-                    // 2. 放大镜固定放在触摸点的左上方；越界时贴边。
-                    //    注意：外层 BoxWithConstraints 是 Center 对齐，
-                    //    所以放大镜必须显式用 TopStart 对齐，让 absoluteOffset 从左上角算起。
+                    // 2. 放大镜固定放在触摸点的左上方；越界时贴边
                     val desiredCx = tp.x - magGapPx - magRadiusPx
                     val desiredCy = tp.y - magGapPx - magRadiusPx
                     val maxCx = (canvasW - magRadiusPx).coerceAtLeast(magRadiusPx)
@@ -744,26 +798,36 @@ fun EditorScreen() {
             }
         }
 
-        // ============ 状态栏 ============
-        Row(
+        // ============ 状态栏（两行：操作结果 + 图片信息） ============
+        Column(
             modifier = Modifier
                 .fillMaxWidth()
                 .background(Color(0xFF15151B))
-                .padding(horizontal = 10.dp, vertical = 6.dp),
-            verticalAlignment = Alignment.CenterVertically
+                .padding(horizontal = 10.dp, vertical = 6.dp)
         ) {
-            Text(
-                text = status,
-                color = Color(0xFFAAAAB8),
-                fontSize = 12.sp,
-                modifier = Modifier.weight(1f)
-            )
-            if (modified) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
-                    text = "● 已修改",
-                    color = Color(0xFFFF9F0A),
+                    text = actionStatus,
+                    color = Color(0xFFE0E0E8),
                     fontSize = 12.sp,
-                    fontWeight = FontWeight.Bold
+                    fontWeight = FontWeight.Medium,
+                    modifier = Modifier.weight(1f)
+                )
+                if (modified) {
+                    Text(
+                        text = "● 已修改",
+                        color = Color(0xFFFF9F0A),
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            }
+            if (imageInfo.isNotEmpty()) {
+                Text(
+                    text = imageInfo,
+                    color = Color(0xFF8888A0),
+                    fontSize = 11.sp,
+                    modifier = Modifier.padding(top = 2.dp)
                 )
             }
         }
